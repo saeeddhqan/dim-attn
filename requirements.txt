@@ -1,0 +1,10 @@
+numpy
+torch
+wandb
+tensorboard
+wrapt
+datasets
+transformers
+sentencepiece
+einops
+flash_attn
