@@ -163,7 +163,7 @@ class Hawk(nn.Module):
 		Wk = (q + q * Wk[:, :-1]).sigmoid()
 
 		score = (q[:,:,None] * Wk[:,None,:])
-		score.masked_fill_(self.causal_mask, float('-inf'))
+		score.masked_fill_(self.causal_mask.to(x.device), float('-inf'))
 		select = torch.max(score, dim=-2)
 		blocks = torch.cat((torch.zeros_like(blocks[:, :1]).to(x.device), torch.gather(blocks[:, 1:], 2, select.indices) * select.values), dim=1)
 
