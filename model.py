@@ -152,7 +152,7 @@ class Hawk(nn.Module):
 		y = x[:, :, None, 0]
 		q = torch.zeros(B, self.G_per_chunk, 1, D).to(x.device)
 		seqs = []
-		for k in range(self.offset):
+		for k in range(self.offset): # block scan, faster than normal parallel scan once we are in cuda.
 			y = y * alpha[:, :, None, k] + x[:, :, None, k]
 			q = q * Wv[:, :, k, None] + inp_sig[:, :, k, None]
 			seqs.append(y)
@@ -162,7 +162,7 @@ class Hawk(nn.Module):
 		q = q.squeeze(2)[:,:-1]
 		Wk = (q + q * Wk[:, :-1]).sigmoid()
 
-		score = (q[:,:,None] * Wk[:,None,:])
+		score = (q[:,:,None] * Wk[:,None,:]) # this computation in pytorch is a hot point, but in cuda, extremely faster than window attn since there's no sum(sequential)
 		score.masked_fill_(self.causal_mask.to(x.device), float('-inf'))
 		select = torch.max(score, dim=-2)
 		blocks = torch.cat((torch.zeros_like(blocks[:, :1]).to(x.device), torch.gather(blocks[:, 1:], 2, select.indices) * select.values), dim=1)
