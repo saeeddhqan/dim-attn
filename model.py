@@ -109,37 +109,6 @@ class RMSNorm(nn.Module):
 		return self.gamma / self.scale * x
 
 
-# class Hawk(nn.Module):
-# 	def __init__(self, dim: int = 1024, expansion_factor: int = 1.5, kernel_size: int = 4):
-# 		super().__init__()
-# 		hidden = int(dim * expansion_factor)
-# 		self.input = nn.Linear(dim, 2 * hidden, bias=False)
-# 		self.conv = nn.Conv1d(in_channels=hidden, out_channels=hidden, bias=True,
-# 							  kernel_size=kernel_size, groups=hidden, padding=kernel_size - 1)
-# 		self.gates = nn.Linear(hidden, 2 * hidden, bias=True)
-# 		self.forget_base = nn.Parameter(torch.linspace(-4.323, -9, hidden))
-# 		self.output = nn.Linear(hidden, dim, bias=False)
-
-# 		with torch.no_grad():
-# 			self.input.weight.normal_(std=dim ** -0.5)
-# 			self.gates.weight.normal_(std=hidden ** -0.5)
-# 			self.output.weight.normal_(std=hidden ** -0.5)
-
-# 	def forward(self, x: Tensor) -> Tensor:
-# 		_N, T, _C = x.shape
-# 		gate, x = self.input(x).chunk(2, dim=-1)
-# 		x = self.conv(x.mT)[..., :T].mT
-
-# 		# RG-LRU: linear recurrent unit with input-dependent gating
-# 		forget, _input = self.gates(x).chunk(2, dim=-1)
-# 		alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
-# 		beta = (1 - alpha ** 2 + 1e-6).sqrt()
-# 		x = beta * _input.sigmoid() * x
-
-# 		h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-# 		x = self.output(F.gelu(gate) * h)
-# 		return x
-
 class Hawk(nn.Module):
 	def __init__(self, dim: int = 1024, expansion_factor: int = 1.5, kernel_size: int = 4):
 		super().__init__()
@@ -154,7 +123,8 @@ class Hawk(nn.Module):
 		self.chunklen = 1
 		self.offset = conf_model.block_size // self.G
 		self.G_per_chunk = self.G // self.chunklen
-
+		self.causal_mask = torch.triu(torch.ones((self.G - 1, self.G - 1), dtype=torch.bool), diagonal=1).unsqueeze(0).unsqueeze(-1)
+		self.gate_norm = RMSNorm(dim=hidden)
 		with torch.no_grad():
 			self.input.weight.normal_(std=dim ** -0.5)
 			self.gates.weight.normal_(std=hidden ** -0.5)
@@ -162,15 +132,9 @@ class Hawk(nn.Module):
 
 
 	def forward(self, x: Tensor) -> Tensor:
-		cseqs = []
-		chunk_b = None
-
-
-
 		gate, x = self.input(x).chunk(2, dim=-1)
 		x = self.conv(x.mT)[..., :x.size(1)].mT
 
-		# RG-LRU: linear recurrent unit with input-dependent gating
 		forget, _input = self.gates(x).chunk(2, dim=-1)
 		alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
 		beta = (1 - alpha ** 2 + 1e-6).sqrt()
@@ -188,7 +152,7 @@ class Hawk(nn.Module):
 		y = x[:, :, None, 0]
 		q = torch.zeros(B, self.G_per_chunk, 1, D).to(x.device)
 		seqs = []
-		for k in range(offset):
+		for k in range(self.offset):
 			y = y * alpha[:, :, None, k] + x[:, :, None, k]
 			q = q * Wv[:, :, k, None] + inp_sig[:, :, k, None]
 			seqs.append(y)
