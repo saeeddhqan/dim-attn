@@ -31,7 +31,7 @@ params = {
 	'beta2': 0.999, # The less, the more stable
 	'decay_lr': False,
 	'eval_step': 250, # Every n step, we do an evaluation.
-	'iterations': 501, # Like epochs
+	'iterations': 5001, # Like epochs
 	'eval_iterations': 200, # Do n step(s), and calculate loss.
 	'batch_size': 32,
 	'nlayers': 2,

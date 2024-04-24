@@ -295,8 +295,8 @@ class PegasusBlock(nn.Module):
 	def forward(self, x: Tensor) -> Tensor:
 		x = x + self.hawk(self.hawk_norm(x))
 		x = x + self.hawk_gmlp(self.hawk_gmlp_norm(x))
-		x = x + self.smqa(self.smqa_norm(x))
-		x = x + self.smqa_gmlp(self.smqa_gmlp_norm(x))
+# 		x = x + self.smqa(self.smqa_norm(x))
+# 		x = x + self.smqa_gmlp(self.smqa_gmlp_norm(x))
 		return x
 
 
