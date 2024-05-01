@@ -109,37 +109,6 @@ class RMSNorm(nn.Module):
 		return self.gamma / self.scale * x
 
 
-# class Hawk(nn.Module):
-# 	def __init__(self, dim: int = 1024, expansion_factor: int = 1.5, kernel_size: int = 4):
-# 		super().__init__()
-# 		hidden = int(dim * expansion_factor)
-# 		self.input = nn.Linear(dim, 2 * hidden, bias=False)
-# 		self.conv = nn.Conv1d(in_channels=hidden, out_channels=hidden, bias=True,
-# 							  kernel_size=kernel_size, groups=hidden, padding=kernel_size - 1)
-# 		self.gates = nn.Linear(hidden, 2 * hidden, bias=True)
-# 		self.forget_base = nn.Parameter(torch.linspace(-4.323, -9, hidden))
-# 		self.output = nn.Linear(hidden, dim, bias=False)
-
-# 		with torch.no_grad():
-# 			self.input.weight.normal_(std=dim ** -0.5)
-# 			self.gates.weight.normal_(std=hidden ** -0.5)
-# 			self.output.weight.normal_(std=hidden ** -0.5)
-
-# 	def forward(self, x: Tensor) -> Tensor:
-# 		_N, T, _C = x.shape
-# 		gate, x = self.input(x).chunk(2, dim=-1)
-# 		x = self.conv(x.mT)[..., :T].mT
-
-# 		# RG-LRU: linear recurrent unit with input-dependent gating
-# 		forget, _input = self.gates(x).chunk(2, dim=-1)
-# 		alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
-# 		beta = (1 - alpha ** 2 + 1e-6).sqrt()
-# 		x = beta * _input.sigmoid() * x
-
-# 		h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-# 		x = self.output(F.gelu(gate) * h)
-# 		return x
-
 class Hawk(nn.Module):
 	def __init__(self, dim: int = 1024, expansion_factor: int = 1.5, kernel_size: int = 4):
 		super().__init__()
@@ -151,10 +120,11 @@ class Hawk(nn.Module):
 		self.forget_base = nn.Parameter(torch.linspace(-4.323, -9, hidden))
 		self.output = nn.Linear(hidden, dim, bias=False)
 		self.G = conf_model.ngroups # for 256 window
-		self.chunklen = 1 if conf_model.block_size <= 4096 else c_params[conf_model.block_size]
+		self.chunklen = 1
 		self.offset = conf_model.block_size // self.G
 		self.G_per_chunk = self.G // self.chunklen
-
+		self.causal_mask = torch.triu(torch.ones((self.G - 1, self.G - 1), dtype=torch.bool), diagonal=1).unsqueeze(0).unsqueeze(-1)
+		self.gate_norm = RMSNorm(dim=hidden)
 		with torch.no_grad():
 			self.input.weight.normal_(std=dim ** -0.5)
 			self.gates.weight.normal_(std=hidden ** -0.5)
@@ -162,15 +132,9 @@ class Hawk(nn.Module):
 
 
 	def forward(self, x: Tensor) -> Tensor:
-		cseqs = []
-		chunk_b = None
-
-
-
 		gate, x = self.input(x).chunk(2, dim=-1)
 		x = self.conv(x.mT)[..., :x.size(1)].mT
 
-		# RG-LRU: linear recurrent unit with input-dependent gating
 		forget, _input = self.gates(x).chunk(2, dim=-1)
 		alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
 		beta = (1 - alpha ** 2 + 1e-6).sqrt()
@@ -178,59 +142,36 @@ class Hawk(nn.Module):
 		x = beta * inp_sig * x
 		
 		B, T, D = x.shape
-		Wq = x[:, :, -2, None]
-		Wk = x.view(B, self.G, self.offset, D)[:, :, -1, -3, None]
-		Wv = x[:, :, -1, None]
+		x = x.view(B, self.G, self.offset, D)
+		Wk = x[:, :, -1, -3, None]
+		Wv = x[:, :, :, -1, None]
 
-		for i in range(self.chunklen):
-			pG = i * self.G_per_chunk
-			eG = pG + self.G_per_chunk
+		alpha = alpha.view(B, self.G, self.offset, D)
+		inp_sig = inp_sig.view(B, self.G, self.offset, D)
 
-			seqs = []
-			qs = []
-			blocks = []
-			for g in range(pG, eG):
-				offg = self.offset * g
-				y = x.view(B, self.G, self.offset, D)[:, g, 0].view(B, 1, D)
-				q = torch.zeros(B, 1, D).to(x.device)
-				o = []
-				qq = []
-				for k in range(self.offset):
-					if i > 0 and k == 0 and g == pG: ## inject data from prev chunk
-						y = alpha[:, None, offg + k] * chunk_b + x[:, None, offg + k]
-					else:
-						y = alpha[:, None, offg + k] * y + x[:, None, offg + k]
-					q = q * Wv[:, offg + k, None] + inp_sig[:, None, offg + k]
-					o.append(y)
+		y = x[:, :, None, 0]
+		q = torch.zeros(B, self.G_per_chunk, 1, D).to(x.device)
+		seqs = []
+		for k in range(self.offset): # block scan, faster than normal parallel scan once we are in cuda.
+			y = y * alpha[:, :, None, k] + x[:, :, None, k]
+			q = q * Wv[:, :, k, None] + inp_sig[:, :, k, None]
+			seqs.append(y)
 
-				seqs.append(torch.stack(o, dim=1))
-				blocks.append(y)
-				qs.append(q)
+		seqs = torch.stack(seqs, dim=2)
+		blocks = seqs[:,:,-1].squeeze(2)
+		q = q.squeeze(2)[:,:-1]
+		Wk = (q + q * Wk[:, :-1]).sigmoid()
 
-			seqs = torch.stack(seqs, dim=1).view(B, T // self.chunklen, D).contiguous()
-			blocks = torch.stack(blocks, dim=1).squeeze(-2)
-			qs = torch.stack(qs, dim=1).squeeze(-2).sigmoid()
-			kBh = (qs * Wk[:, pG:eG] + qs).sigmoid()
-			blocks_res = torch.zeros_like(blocks)
+		score = (q[:,:,None] * Wk[:,None,:]) # this computation in pytorch is a hot point, but in cuda, extremely faster than window attn since there's no sum(sequential)
+		score.masked_fill_(self.causal_mask.to(x.device), float('-inf'))
+		select = torch.max(score, dim=-2)
+		blocks = torch.cat((torch.zeros_like(blocks[:, :1]).to(x.device), torch.gather(blocks[:, 1:], 2, select.indices) * select.values), dim=1)
 
-			for i in range(1, self.G_per_chunk - 1):
-				tscore = (qs[:, i, None] * kBh[:,[t for t in range(i)]]).mT # Q * K
-				for j in range(D):
-					select2 = torch.max(tscore[:,j], dim=-1)
-					selected = blocks.mT[torch.arange(B), j, select2.indices]
-					blocks_res[:, i, j] = selected * select2.values # Vp * (Q * K)
+		seqs = self.gate_norm((seqs.squeeze(3) + blocks[:,:,None,:]).view(B, T, D))
+		seqs = gate * gate.sigmoid() * seqs # silu*
 
-			blocks = blocks_res + blocks # Vt + (Vp * Q * K)
-			for i in range(1, self.G_per_chunk):
-				xoff = i * self.offset
-				seqs[:, xoff: xoff + self.offset] = (seqs[:, xoff: xoff + self.offset] + blocks[:, None, i - 1]).sigmoid()
-			cseqs.append(seqs)
-			chunk_b = seqs[:, None, -1]
-		x = torch.stack(cseqs, dim=1).view(B, T, D).contiguous()
-		x = gate * gate.sigmoid() * x # silu
-
-		x = self.output(x)
-		return x
+		seqs = self.output(seqs)
+		return seqs
 
 
 class GatedMLP(nn.Module):
@@ -295,8 +236,8 @@ class PegasusBlock(nn.Module):
 	def forward(self, x: Tensor) -> Tensor:
 		x = x + self.hawk(self.hawk_norm(x))
 		x = x + self.hawk_gmlp(self.hawk_gmlp_norm(x))
-		x = x + self.smqa(self.smqa_norm(x))
-		x = x + self.smqa_gmlp(self.smqa_gmlp_norm(x))
+# 		x = x + self.smqa(self.smqa_norm(x))
+# 		x = x + self.smqa_gmlp(self.smqa_gmlp_norm(x))
 		return x
 
 
